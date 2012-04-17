@@ -8,12 +8,15 @@ use Carp;
 use Encode;
 use DateTime;
 use DateTime::Format::Natural;
+use DateTime::Format::Oracle;
+use Data::Dumper;
+use DateTime::Format::Natural;
 use List::MoreUtils qw(none any);
 use DBI;
 Readonly::Scalar my $DEBUG => 0;
 use constant cnNoFlags => 0;
 use constant cnNoCheckpoint => -1;
-# ABSTRACT: A perl wrap for C3000 API!
+# ABSTRACT: A perl wrap for C3000 API!!!
 
 =head1 NAME
 
@@ -27,7 +30,7 @@ Version 0.01
 
 =cut
 
-our $VERSION = '0.060';
+our $VERSION = '1.01';
 
 =head1 SYNOPSIS
  
@@ -47,7 +50,7 @@ init sub
 =cut
 
 my $Empty;
-
+$ENV{'NLS_DATE_FORMAT'} = 'YYYY-MM-DD HH24:MI';
 sub new {
     my $this              = shift;
 	
@@ -59,7 +62,7 @@ sub new {
     my $active_element_template_manager =
       Win32::OLE->new('Athena.CT.ActiveElementTemplateManager.1');
     my $security_token = Win32::OLE->new('AthenaSecurity.UserSessions.1');
-    $security_token->ConvergeLogin( 'Administrator', 'Athena', 0, 666 );
+    $security_token->ConvergeLogin( 'landisgyr', 'c3000sys', 0, 666 );
     my $adas_instance_manager =
       Win32::OLE->new('Athena.AS.ADASInstanceManager.1')
       or croak;
@@ -75,8 +78,12 @@ sub new {
       Win32::OLE->new('DeviceAndMeterdata.ADASDeviceAndMeterdata.1');
     my $LPD =
       Win32::OLE->new('Converge.LoadProfileData.1');
+	my $AMD =
+	  Win32::OLE->new('Athena.CT.AMD_Utils');
+	my $tariff_manager =
+	  Win32::OLE->new('Athena.CT.TariffRateManager');
       #init end
-    
+    $dbh->do("alter session set nls_date_format = \'YYYY-MM-DD HH24:MI\'"); 
 
     my $self = {
 	    dbh			    			 => $dbh,
@@ -90,6 +97,8 @@ sub new {
         ADASTemplateManager          => $adas_template_manager,
         DataSegment                  => $data_segment_helper,
 		LPD                          => $LPD,
+		AMD							 => $AMD,
+		TariffManager                => $tariff_manager,
     };
     return bless $self, $this;
 
@@ -116,34 +125,13 @@ sub get_LP {
     my $self = shift;
     my ( $return_fields, $criteria ) = @_;
     my $rs =
-      $self->{'MeterDataInterface'}
-      ->GetLoadProfile( $return_fields, $criteria, 0 )
-      or croak $self->{'MeterDataInterface'}->LastError();
+      $self->{'MeterDataInterface'}->GetLoadProfile( $return_fields, $criteria, 0 );
+      do{print Win32::OLE->LastError(); croak;}if(Win32::OLE->LastError());
     return $rs;
 }
 =head2 save_LP
 
-below is a vbs code, please check!
-Set mdi = CreateObject("DeviceAndMeterdata.ADASDeviceAndMeterdata.1") 
- 
-return_fields = Array( "ADAS_DEVICE", "ADAS_VARIABLE" ) 
-criteria      = Array( Array("ADAS_DEVICE_NAME",   "+SimMeter001" ), _ 
-                       Array("ADAS_VARIABLE_NAME", "Simulated profile" ) ) 
-Set recordset = mdi.FindVariable( return_fields, criteria, Empty, 0 ) 
-If Not recordset.EOF Then  
-  device_id   = recordset.Fields( "ADAS_DEVICE" ) 
-  variable_id = recordset.Fields( "ADAS_VARIABLE" ) 
-  ' Initialize record set structure 
-  Set lp_values = CreateObject( "ADODB.RecordSet" ) 
-  lp_values.Fields.Append "ADAS_TIME_GMT",  7, -1, False   ' type adDate 
-  lp_values.Fields.Append "ADAS_VAL_RAW", 203, 20, True    ' type adLongVarWChar, size 20 
-  ' Fill record set with data 
-  lp_values.Open 
-  lp_values.AddNew 
-  lp_values.Fields( "ADAS_TIME_GMT" ).Value = DateSerial( 2003,1,31 ) + TimeSerial( 9,0,0 ) 
-  lp_values.Fields( "ADAS_VAL_RAW" ).Value  = 123 
-  ' Save the load profile 
-  mdi.Save_LP device_id, variable_id, lp_values, 1 
+
 
 =cut
 
@@ -153,8 +141,9 @@ sub save_LP{
 
 	my $self = shift;
     my ($device_id, $var_id, $rs, $flag) = @_;
-	$self->{'MeterDataInterface'}->Save_LP($device_id, $var_id, $rs, $flag)
-	   or croak $self->{'MeterDataInterface'}->LastError();
+    
+	$self->{'MeterDataInterface'}->Save_LP($device_id, $var_id, $rs, $flag);
+	   do{print Win32::OLE->LastError(); die;}if(Win32::OLE->LastError());
    
 
 }
@@ -164,58 +153,60 @@ sub save_LP{
 
 		return a accumulation value of LoadProfile
 	
-		$hl->accu_LP('ADAS_VAL_RAW', '海电%', '+A', $dt_yesterday, $dt_today);
+		$hl->accu_LP('%', '+A', $dt_yesterday, $dt_today);
 	
-		$hl->accu_LP('ADAS_VAL_NORM', '%', '+A', $dt_yesterday, $dt_today);
+		$hl->accu_LP('%', '+A', $dt_yesterday, $dt_today);
 		 
 
 
 =cut
 
-sub accu_LP {
+sub accu_value {
     my $self = shift;
-
-	#  add criteria fields for meter proxy
-    my ( $LP_return_fields, $device, $var, $dt_from, $dt_to,$search_string ) = @_;
-    my ($proxy_criteria, $ID_from_proxy);
-	if (defined $search_string){
-       $proxy_criteria = eval($search_string); 
-       $ID_from_proxy  = $self->search_meter_by_proxyattr($proxy_criteria);
-    }
-    #get device
+    my ( $device, $var, $dt_from, $dt_to ) = @_;
+      my $from_tag = 'ADAS_TIME_GMT';   #change when lp or bv;
+    my $to_tag   = 'ADAS_TIME_GMT';
+	my   $LP_return_fields = ['ADAS_VAL_NORM', 'ADAS_TIME_GMT'];
+    $dt_to->set_time_zone('UTC');
+    $dt_from->set_time_zone('UTC');
+    my $date_from            = $self->convert_VT_DATE($dt_from);
+    my $date_to              = $self->convert_VT_DATE($dt_to);
     my $device_return_fields = [
         'ADAS_DEVICE',      'ADAS_VARIABLE',
-        'ADAS_DEVICE_NAME', 'ADAS_VARIABLE_NAME'
+         'ADAS_DEVICE_NAME', 'ADAS_VARIABLE_NAME', 'ADAS_VARIABLE_TYPE',
     ];
-    my $device_criteria =
-      [ [ 'ADAS_DEVICE_NAME', $device ], [ 'ADAS_VARIABLE_NAME', $var ] ];
-    my $rs_device =
-      $self->search_device( $device_return_fields, $device_criteria );
-	$dt_from->set_time_zone('UTC');
-	$dt_to->set_time_zone('UTC');
+    my %LP_values;    #return variable;
+    my $LP_key;
+	my $value = 0;
+    if ( ref $device ne ref [] ) {    # means device name
 
+        my $device_criteria =
+          [ [ 'ADAS_DEVICE_NAME', $device ], [ 'ADAS_VARIABLE_NAME', $var ] ];
+        my $rs_device =
+          $self->search_device( $device_return_fields, $device_criteria );             
 
-    $LP_return_fields = [ $LP_return_fields, 'ADAS_TIME_GMT' ];
-    my $date_from        = $self->convert_VT_DATE($dt_from);
-    my $date_to          = $self->convert_VT_DATE($dt_to);
-    my $value = 0;
-
-    while ( !$rs_device->EOF ) {
-        my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
-         
-		  next if defined $proxy_criteria && (defined $ID_from_proxy) && none { $device_id == $_ } @{$ID_from_proxy};
-        my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
-        my $LP_criteria = [
-            [ 'ADAS_DEVICE',   $device_id ],
-            [ 'ADAS_VARIABLE', $var_id ],
-            [ 'ADAS_TIME_GMT', $date_from, '>' ],
-            [ 'ADAS_TIME_GMT', $date_to,   '<=' ]
-        ];
-        my $rs =
-          $self->{'MeterDataInterface'}
-          ->GetLoadProfile( $LP_return_fields, $LP_criteria, 0 )
-          or croak $self->{'MeterDataInterface'}->LastError();
-        while ( !$rs->EOF ) {
+        return 0 if $rs_device->RecordCount == 0;
+        while ( !$rs_device->EOF ) {
+            my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
+            my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
+			my $handle_name;
+			if($rs_device->Fields('ADAS_VARIABLE_TYPE')->{Value} eq 'PROFILE'){
+				$handle_name = 'get_LP';
+			}
+			else{
+				$handle_name = 'get_BV';
+				$from_tag = 'ADAS_RESET_TIME';
+				$to_tag   = 'ADAS_RESET_TIME';
+			}
+            my $LP_criteria = [
+                [ 'ADAS_DEVICE',   $device_id, '=' ],
+                [ 'ADAS_VARIABLE', $var_id, '=' ],
+                [ $from_tag,       $date_from, '>' ],
+                [ $to_tag,         $date_to,   '<=' ]
+            ];
+            my $rs;
+		   	eval '$rs = $self->' . $handle_name . '( $LP_return_fields, $LP_criteria )';
+ while ( !$rs->EOF ) {
             $value += $rs->Fields( $LP_return_fields->[0] )->{Value};
 
             carp $rs->Fields( $LP_return_fields->[1] )->{Value}
@@ -224,145 +215,452 @@ sub accu_LP {
               if $DEBUG == 1;
             $rs->MoveNext();
         }
-        $rs_device->MoveNext();
+            $rs_device->MoveNext();
+        }
+    }
+    else {
+		return 0 unless (@{$device});
+        for my $dev_ID ( @{$device} ) {
+
+            my $device_criteria =
+              [ [ 'ADAS_DEVICE', $dev_ID ], [ 'ADAS_VARIABLE_NAME', $var ] ];
+            my $rs_device =
+              $self->search_device( $device_return_fields, $device_criteria );
+
+            next if $rs_device->RecordCount == 0;
+            while ( !$rs_device->EOF ) {
+                my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
+                my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
+              	my $handle_name;
+			if($rs_device->Fields('ADAS_VARIABLE_TYPE')->{Value} eq 'PROFILE'){
+				$handle_name = 'get_LP';
+			}
+			else{
+				$handle_name = 'get_BV';
+				$from_tag = 'ADAS_RESET_TIME';
+				$to_tag   = 'ADAS_RESET_TIME';
+			}
+            my $LP_criteria = [
+                [ 'ADAS_DEVICE',   $device_id, '=' ],
+                [ 'ADAS_VARIABLE', $var_id, '=' ],
+                [ $from_tag,       $date_from, '>' ],
+                [ $to_tag,         $date_to,   '<=' ]
+            ];
+            my $rs;
+		   	eval '$rs = $self->' . $handle_name . '( $LP_return_fields, $LP_criteria )';
+                    while ( !$rs->EOF ) {
+            			$value += $rs->Fields( $LP_return_fields->[0] )->{Value};
+
+            			carp $rs->Fields( $LP_return_fields->[1] )->{Value}
+              					. "meter value is"
+              					. $value
+              					if $DEBUG == 1;
+            			$rs->MoveNext();
+        			}
+                $rs_device->MoveNext();
+            }
+        }
+
     }
     return $value;
 }
+    
 
-=head2 get_single_LP
-
-		return a single value or a hash 
-
-
-		get_single_LP('ADAS_VAL_RAW', '海电_主表110', '+A', 'today');
-
-		get_single_LP('ADAS_VAL_NORM', '主表%', 'yesterday');          
-
-as above, get_single_LP function return a value  or a hash when value is more than one.
-
-=cut
-
-sub get_single_LP {
+sub accu_tariff_value {             
     my $self = shift;
-	# add criteria fields for meter proxy
-    my ( $LP_return_fields, $device, $var, $dt_obj, $search_string ) = @_;
-	my ($proxy_criteria, $ID_from_proxy);
-	if (defined $search_string){
-       $proxy_criteria = eval($search_string); 
-       $ID_from_proxy  = $self->search_meter_by_proxyattr($proxy_criteria);
-    }	
-
-    $LP_return_fields = [$LP_return_fields];
-	my $dt_from = $dt_obj->clone();
-    $dt_from->subtract( minutes => 1 );
-    $dt_obj->set_time_zone('UTC');
-	$dt_from->set_time_zone('UTC');
+    my ( $device, $var_str, $dt_from, $dt_to ) = @_;
+	my ($var, $AE_ID, $tariff_name) = split(/~/, $var_str);
+    my $tariff_ID = $self->get_tariff_id($tariff_name);	
+      my $from_tag = 'ADAS_TIME_GMT';   #change when lp or bv;
+    my $to_tag   = 'ADAS_TIME_GMT';
+	my   $LP_return_fields = ['ADAS_VAL_NORM', 'ADAS_TIME_GMT'];
+    $dt_to->set_time_zone('UTC');
+    $dt_from->set_time_zone('UTC');
     my $date_from            = $self->convert_VT_DATE($dt_from);
-    my $date_to              = $self->convert_VT_DATE($dt_obj);
+    my $date_to              = $self->convert_VT_DATE($dt_to);
     my $device_return_fields = [
         'ADAS_DEVICE',      'ADAS_VARIABLE',
-        'ADAS_DEVICE_NAME', 'ADAS_VARIABLE_NAME'
+         'ADAS_DEVICE_NAME', 'ADAS_VARIABLE_NAME', 'ADAS_VARIABLE_TYPE',
     ];
-    my $device_criteria =
-      [ [ 'ADAS_DEVICE_NAME', $device ], [ 'ADAS_VARIABLE_NAME', $var ] ];
-    my $rs_device =
-      $self->search_device( $device_return_fields, $device_criteria )
-      ;    #record set of device;
-    my %LP_values ;
+    my %LP_values;    #return variable;
     my $LP_key;
-    while ( !$rs_device->EOF ) {
-        my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
-		 next if defined $proxy_criteria && (defined $ID_from_proxy) && none { $device_id == $_ } @{$ID_from_proxy};
-        my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
-        my $LP_criteria = [
-            [ 'ADAS_DEVICE',   $device_id ],
-            [ 'ADAS_VARIABLE', $var_id ],
-            [ 'ADAS_TIME_GMT', $date_from, '>' ],
-            [ 'ADAS_TIME_GMT', $date_to,   '<=' ]
-        ];
-        my $rs =
-          $self->{'MeterDataInterface'}
-          ->GetLoadProfile( $LP_return_fields, $LP_criteria, 0 )
-          or croak $self->{'MeterDataInterface'}->LastError();
-        while ( !$rs->EOF ) {
-             $LP_key =
-                $rs_device->Fields('ADAS_DEVICE_NAME') . "_"
-              . $rs_device->Fields('ADAS_VARIABLE_NAME');
-            $LP_values{$LP_key} =
-              $rs->Fields( $LP_return_fields->[0] )->{Value};
-            $rs->MoveNext();
-        }
-        $rs_device->MoveNext();
-    }
+	my $value = 0;
+    if ( ref $device ne ref [] ) {    # means device name
 
-    return keys %LP_values <= 1 ? $LP_values{ $LP_key }   :  \%LP_values;
+        my $device_criteria =
+          [ [ 'ADAS_DEVICE_NAME', $device ], [ 'ADAS_VARIABLE_NAME', $var ] ];
+        my $rs_device =
+          $self->search_device( $device_return_fields, $device_criteria );             
 
-}
+        return 0 if $rs_device->RecordCount == 0;
+        while ( !$rs_device->EOF ) {
+            my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
+            my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
+			my $period      = $self->get_period($device_id, $var_id);
+			my $tariff_list = $self->get_tariff($AE_ID, $date_from, $date_to, $period);
+			my $i = 0;
+			my $handle_name;
+			if($rs_device->Fields('ADAS_VARIABLE_TYPE')->{Value} eq 'PROFILE'){
+				$handle_name = 'get_LP';
+			}
+			else{
+				$handle_name = 'get_BV';
+				$from_tag = 'ADAS_RESET_TIME';
+				$to_tag   = 'ADAS_RESET_TIME';
+			}
+            my $LP_criteria = [
+                [ 'ADAS_DEVICE',   $device_id, '=' ],
+                [ 'ADAS_VARIABLE', $var_id, '=' ],
+                [ $from_tag,       $date_from, '>' ],
+                [ $to_tag,         $date_to,   '<=' ]
+            ];
+            my $rs;
+		   	eval '$rs = $self->' . $handle_name . '( $LP_return_fields, $LP_criteria )';
+ while ( !$rs->EOF ) {
+            $value += $rs->Fields( $LP_return_fields->[0] )->{Value} if $tariff_list->[$i][0] eq $tariff_ID;
 
-sub get_last_date {
-   my $self = shift;
-
-
-
-}
-
-sub get_billing {
-     my $self = shift;
-
-	#  add criteria fields for meter proxy
-    my ( $billing_return_fields, $device, $var, $dt_from, $dt_to,$search_string ) = @_;
-    my ($proxy_criteria, $ID_from_proxy);
-	if (defined $search_string){
-       $proxy_criteria = eval($search_string); 
-       $ID_from_proxy  = $self->search_meter_by_proxyattr($proxy_criteria);
-    }
-    #get device
-    my $device_return_fields = [
-        'ADAS_DEVICE',      'ADAS_VARIABLE',
-        'ADAS_DEVICE_NAME', 'ADAS_VARIABLE_NAME'
-    ];
-    my $device_criteria =
-      [ [ 'ADAS_DEVICE_NAME', $device ], [ 'ADAS_VARIABLE_NAME', $var ] ];
-    my $rs_device =
-      $self->search_device( $device_return_fields, $device_criteria );
-	$dt_from->set_time_zone('UTC');
-	$dt_to->set_time_zone('UTC');
-
-
-    $billing_return_fields = [ $billing_return_fields, 'ADAS_TIME_GMT' ];
-    my $date_from        = $self->convert_VT_DATE($dt_from);
-    my $date_to          = $self->convert_VT_DATE($dt_to);
-    my $value = 0;
-
-    while ( !$rs_device->EOF ) {
-        my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
-         
-		  next if defined $proxy_criteria && (defined $ID_from_proxy) && none { $device_id == $_ } @{$ID_from_proxy};
-        my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
-        my $billing_criteria = [
-            [ 'ADAS_DEVICE',   $device_id ],
-            [ 'ADAS_VARIABLE', $var_id ],
-            [ 'ADAS_TIME_GMT', $date_from, '>' ],
-            [ 'ADAS_TIME_GMT', $date_to,   '<=' ]
-        ];
-        my $rs =
-          $self->{'MeterDataInterface'}
-          ->GetBillingData( $billing_return_fields, $billing_criteria, [ ['ADAS_TIME_GMT', 'A'] ], 0 )
-          or croak $self->{'MeterDataInterface'}->LastError();
-        while ( !$rs->EOF ) {
-            $value += $rs->Fields( $billing_return_fields->[0] )->{Value};
-
-            carp $rs->Fields( $billing_return_fields->[1] )->{Value}
+            carp $rs->Fields( $LP_return_fields->[1] )->{Value}
               . "meter value is"
               . $value
               if $DEBUG == 1;
             $rs->MoveNext();
+			$i++;
         }
-        $rs_device->MoveNext();
+            $rs_device->MoveNext();
+        }
+    }
+    else {
+		return 0 unless (@{$device});
+        for my $dev_ID ( @{$device} ) {
+
+            my $device_criteria =
+              [ [ 'ADAS_DEVICE', $dev_ID ], [ 'ADAS_VARIABLE_NAME', $var ] ];
+            my $rs_device =
+              $self->search_device( $device_return_fields, $device_criteria );
+
+            next if $rs_device->RecordCount == 0;
+            while ( !$rs_device->EOF ) {
+                my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
+                my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
+				my $period      = $self->get_period($device_id, $var_id);
+				my $tariff_list = $self->get_tariff($AE_ID, $date_from, $date_to, $period);
+				my $i = 0;
+              	my $handle_name;
+			if($rs_device->Fields('ADAS_VARIABLE_TYPE')->{Value} eq 'PROFILE'){
+				$handle_name = 'get_LP';
+			}
+			else{
+				$handle_name = 'get_BV';
+				$from_tag = 'ADAS_RESET_TIME';
+				$to_tag   = 'ADAS_RESET_TIME';
+			}
+            my $LP_criteria = [
+                [ 'ADAS_DEVICE',   $device_id, '=' ],
+                [ 'ADAS_VARIABLE', $var_id, '=' ],
+                [ $from_tag,       $date_from, '>' ],
+                [ $to_tag,         $date_to,   '<=' ]
+            ];
+            my $rs;
+		   	eval '$rs = $self->' . $handle_name . '( $LP_return_fields, $LP_criteria )';
+                    while ( !$rs->EOF ) {
+            			$value += $rs->Fields( $LP_return_fields->[0] )->{Value} if $tariff_list->[$i][0] eq $tariff_ID;
+
+            			carp $rs->Fields( $LP_return_fields->[1] )->{Value}
+              					. "meter value is"
+              					. $value
+              					if $DEBUG == 1;
+            			$rs->MoveNext();
+						$i++;
+        			}
+                $rs_device->MoveNext();
+            }
+        }
+
     }
     return $value;
+}
+
+sub get_variable_name{
+	my $self = shift;
+    my ( $device, $var ) = @_;
+    my $device_return_fields = [
+        'ADAS_DEVICE',      'ADAS_VARIABLE',
+        'ADAS_DEVICE_NAME', 'ADAS_VARIABLE_NAME', 'ADAS_VARIABLE_TYPE',
+    ];
+    my @variables_name;    #return variable;
+
+    if ( ref $device ne ref [] ) {    # means device name
+
+        my $device_criteria =
+          [ [ 'ADAS_DEVICE_NAME', $device ], [ 'ADAS_VARIABLE_NAME', $var ] ];
+        my $rs_device =
+          $self->search_device( $device_return_fields, $device_criteria )
+          ;                           #record set of device;
+        return 0 if $rs_device->RecordCount == 0;
+        while ( !$rs_device->EOF ) {
+            my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
+            my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
+	    
+               push @variables_name, 
+                    $rs_device->Fields('ADAS_DEVICE_NAME')->{Value} . "_"
+                  . $rs_device->Fields('ADAS_VARIABLE_NAME')->{Value};
+            $rs_device->MoveNext();
+        }
+    }
+    else {
+		return 0 unless (@{$device});
+        for my $dev_ID ( @{$device} ) {
+            my $device_criteria =
+              [ [ 'ADAS_DEVICE', $dev_ID ], [ 'ADAS_VARIABLE_NAME', $var ] ];
+            my $rs_device =
+              $self->search_device( $device_return_fields, $device_criteria );
+
+            next if $rs_device->RecordCount == 0;
+            while ( !$rs_device->EOF ) {
+                push @variables_name,
+                        $rs_device->Fields('ADAS_DEVICE_NAME')->{Value} . "_"
+                      . $rs_device->Fields('ADAS_VARIABLE_NAME')->{Value};
+                $rs_device->MoveNext();
+            }
+        }
+
+    }
+	return \@variables_name;
 
 }
+
+
+
+
+sub get_single_value {
+    my $self = shift;
+    my ( $LP_return_fields, $device, $var, $dt_obj ) = @_;
+    my $from_tag = 'ADAS_TIME_GMT';   #change when lp or bv;
+    my $to_tag   = 'ADAS_TIME_GMT';
+    if ( ref($LP_return_fields) ne ref [] ) {
+        $LP_return_fields = [$LP_return_fields];
+    }
+    my $dt_from = $dt_obj->clone();
+    $dt_from->subtract( minutes => 1 );
+    $dt_obj->set_time_zone('UTC');
+    $dt_from->set_time_zone('UTC');
+    my $date_from            = $self->convert_VT_DATE($dt_from);
+    my $date_to              = $self->convert_VT_DATE($dt_obj);
+    my $device_return_fields = [
+        'ADAS_DEVICE',      'ADAS_VARIABLE',
+        'ADAS_DEVICE_NAME', 'ADAS_VARIABLE_NAME', 'ADAS_VARIABLE_TYPE',
+    ];
+    my @values;    #return variable;
+
+    if ( ref $device ne ref [] ) {    # means device name
+
+        my $device_criteria =
+          [ [ 'ADAS_DEVICE_NAME', $device ], [ 'ADAS_VARIABLE_NAME', $var ] ];
+        my $rs_device =
+          $self->search_device( $device_return_fields, $device_criteria )
+          ;                           #record set of device;
+        return 0 if $rs_device->RecordCount == 0;
+        while ( !$rs_device->EOF ) {
+            my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
+            my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
+	    
+            	my $handle_name;
+			if($rs_device->Fields('ADAS_VARIABLE_TYPE')->{Value} eq 'PROFILE'){
+				$handle_name = 'get_LP';
+			}
+			else{
+				$handle_name = 'get_BV';
+				$from_tag = 'ADAS_RESET_TIME';
+				$to_tag   = 'ADAS_RESET_TIME';
+			}
+            my $LP_criteria = [
+                [ 'ADAS_DEVICE',   $device_id, '=' ],
+                [ 'ADAS_VARIABLE', $var_id, '=' ],
+                [ $from_tag,       $date_from, '>' ],
+                [ $to_tag,         $date_to,   '<=' ]
+            ];
+            my $rs;
+		   	eval '$rs = $self->' . $handle_name . '( $LP_return_fields, $LP_criteria )';
+            while ( !$rs->EOF ) {
+					push @values, join '__', map { $rs->Fields($_)->{Value} } @{$LP_return_fields};
+                $rs->MoveNext();
+            }
+            $rs_device->MoveNext();
+    	}
+	}
+    else {
+		
+		return 0 unless (@{$device});
+        for my $dev_ID ( @{$device} ) {
+
+            my $device_criteria =
+              [ [ 'ADAS_DEVICE', $dev_ID ], [ 'ADAS_VARIABLE_NAME', $var ] ];
+            my $rs_device =
+              $self->search_device( $device_return_fields, $device_criteria );
+
+            next if $rs_device->RecordCount == 0;
+            while ( !$rs_device->EOF ) {
+                my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
+                my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
+             	my $handle_name;
+			if($rs_device->Fields('ADAS_VARIABLE_TYPE')->{Value} eq 'PROFILE'){
+				$handle_name = 'get_LP';
+			}
+			else{
+				$handle_name = 'get_BV';
+				$from_tag = 'ADAS_RESET_TIME';
+				$to_tag   = 'ADAS_RESET_TIME';
+			}
+            my $LP_criteria = [
+                [ 'ADAS_DEVICE',   $device_id, '=' ],
+                [ 'ADAS_VARIABLE', $var_id, '=' ],
+                [ $from_tag,       $date_from, '>' ],
+                [ $to_tag,         $date_to,   '<=' ]
+            ];
+            my $rs;
+		   	eval '$rs = $self->' . $handle_name . '( $LP_return_fields, $LP_criteria )';
+                while ( !$rs->EOF ) {
+                        push @values, join '__', map { $rs->Fields($_)->{Value} } @{$LP_return_fields};
+                    	$rs->MoveNext();
+                }
+                $rs_device->MoveNext();
+            }
+        }
+
+    }
+    return @values	== 1 ? $values[0] : \@values;
+}
+
+sub get_range_value {
+    my $self = shift;
+    my ( $LP_return_fields, $device, $var, $dt_from, $dt_to ) = @_;
+  my $from_tag = 'ADAS_TIME_GMT';   #change when lp or bv;
+    my $to_tag   = 'ADAS_TIME_GMT';
+    if ( ref($LP_return_fields) ne ref [] ) {
+        $LP_return_fields = [$LP_return_fields];
+    }
+    $dt_to->set_time_zone('UTC');
+    $dt_from->set_time_zone('UTC');
+    my $date_from            = $self->convert_VT_DATE($dt_from);
+    my $date_to              = $self->convert_VT_DATE($dt_to);
+    my $device_return_fields = [
+        'ADAS_DEVICE',      'ADAS_VARIABLE',
+          'ADAS_DEVICE_NAME', 'ADAS_VARIABLE_NAME', 'ADAS_VARIABLE_TYPE',
+    ];
+    my %LP_values;    #return variable;
+    my $LP_key;
+
+    if ( ref $device ne ref [] ) {    # means device name
+
+        my $device_criteria =
+          [ [ 'ADAS_DEVICE_NAME', $device ], [ 'ADAS_VARIABLE_NAME', $var ] ];
+        my $rs_device =
+          $self->search_device( $device_return_fields, $device_criteria )
+          ;                           #record set of device;
+
+        return 0 if $rs_device->RecordCount == 0;
+        while ( !$rs_device->EOF ) {
+            my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
+            my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
+            	my $handle_name;
+			if($rs_device->Fields('ADAS_VARIABLE_TYPE')->{Value} eq 'PROFILE'){
+				$handle_name = 'get_LP';
+			}
+			else{
+				$handle_name = 'get_BV';
+				$from_tag = 'ADAS_RESET_TIME';
+				$to_tag   = 'ADAS_RESET_TIME';
+			}
+            my $LP_criteria = [
+                [ 'ADAS_DEVICE',   $device_id, '=' ],
+                [ 'ADAS_VARIABLE', $var_id, '=' ],
+                [ $from_tag,       $date_from, '>' ],
+                [ $to_tag,         $date_to,   '<=' ]
+            ];
+            my $rs;
+		   	eval '$rs = $self->' . $handle_name . '( $LP_return_fields, $LP_criteria )';
+                $LP_key =
+                    $rs_device->Fields('ADAS_DEVICE_NAME')->{Value} . "_"
+                  . $rs_device->Fields('ADAS_VARIABLE_NAME')->{Value};
+                    $LP_values{$LP_key} = $rs;
+            
+            $rs_device->MoveNext();
+        }
+    }
+    else {
+        for my $dev_ID ( @{$device} ) {
+
+            my $device_criteria =
+              [ [ 'ADAS_DEVICE', $dev_ID ], [ 'ADAS_VARIABLE_NAME', $var ] ];
+            my $rs_device =
+              $self->search_device( $device_return_fields, $device_criteria );
+
+            next if $rs_device->RecordCount == 0;
+            while ( !$rs_device->EOF ) {
+                my $device_id   = $rs_device->Fields('ADAS_DEVICE')->{Value};
+                my $var_id      = $rs_device->Fields('ADAS_VARIABLE')->{Value};
+               	my $handle_name;
+			if($rs_device->Fields('ADAS_VARIABLE')->{Value} eq 'PROFILE'){
+				$handle_name = 'get_LP';
+			}
+			else{
+				$handle_name = 'get_BV';
+			}
+            my $LP_criteria = [
+                [ 'ADAS_DEVICE',   $device_id,'=' ],
+                [ 'ADAS_VARIABLE', $var_id, '=' ],
+                [ 'ADAS_TIME_GMT', $date_from, '>' ],
+                [ 'ADAS_TIME_GMT', $date_to,   '<=' ]
+            ];
+            my $rs;
+		   	eval '$rs = $self->' . $handle_name . '( $LP_return_fields, $LP_criteria )';
+                    $LP_key =
+                        $rs_device->Fields('ADAS_DEVICE_NAME')->{Value} . "_"
+                      . $rs_device->Fields('ADAS_VARIABLE_NAME')->{Value};
+                        $LP_values{$LP_key} = $rs;
+                $rs_device->MoveNext();
+            }
+        }
+
+    }
+    return \%LP_values;
+}
+
+sub get_last_time {
+   my $self = shift;
+   my ($device_ID, $var_ID) = @_;
+   my ($last_date) = $self->{'dbh'}->selectrow_array("select PI_NEWEST_VALUE from adas.pop_info where adas_id = ? and var_code = ?", {}, ($device_ID, $var_ID));
+   warn "WARNING!!!: last time doesn't exist!!" if(!defined($last_date));
+   $last_date = '1970-01-01 00:00' if(!defined($last_date));
+  my $dt = DateTime::Format::Oracle->parse_datetime($last_date);
+  return $dt;
+
+}
+
+sub get_period {
+   my $self = shift;
+   my ($device_ID, $var_ID) = @_;
+   my ($period) = $self->{'dbh'}->selectrow_array("select PI_PERIOD from adas.pop_info where adas_id = ? and var_code = ?", {}, ($device_ID, $var_ID));
+   warn "WARNING!!!: period doesn't exist!!" if(!defined($period));
+   $period = 15 if(!defined($period));
+  return $period;
+
+}
+
+sub get_BV {
+
+     my $self = shift;
+    my ( $return_fields, $criteria) = @_;
+    my $order = [ ["ADAS_TIME_GMT", "A" ] ];
+    #converge BIlling API is broken, use database instead.
+    my $rs = $self->{'MeterDataInterface'}->GetBillingData( $return_fields, $criteria, $order, 0 );
+     do{print Win32::OLE->LastError(); die;}if(Win32::OLE->LastError());
+    return $rs;
+}
+
+
+
+
 =head2 search_device
 
 		return a recordset of device info fitting criteria 
@@ -458,6 +756,34 @@ sub del_VMs{
 
 }
 
+sub create_path{
+   my $self = shift;
+   my ($templ_name, $path_name) = @_;
+   
+
+
+}
+sub get_tariff{
+	my ($self, $aeID, $dt_from, $dt_to, $period) = @_;
+	my $AMD_string = 'active_element->Produced("tariff_profile",#'. DateTime::Format::Oracle->format_datetime($dt_from) .'#,#'. DateTime::Format::Oracle->format_datetime($dt_to) . '#,'. $period .')';
+	return $self->eval_AMD($aeID, $AMD_string);
+
+}
+sub get_tariff_id{
+   my ($self, $tariff_name) = @_;
+   my $st = $self->{'UserSessions'};
+   my $TariffRateID = $self->{'TariffManager'}->GetTariffRateID($tariff_name, $st );
+	return $TariffRateID;
+}
+
+sub eval_AMD{
+
+   my ($self ,$aeID, $AMD_string) = @_;
+   my $st = $self->{'UserSessions'};
+   my $result = $self->{'AMD'}->EvaluateTest($aeID, $AMD_string, $Empty, $st);
+   return $result;
+
+}
 =head2  convert_VT_DATE 
 
 
@@ -474,7 +800,7 @@ sub convert_VT_DATE {
     return Variant( VT_DATE, $EPOCH + $dt->epoch / $SEC_PER_DAY );
 }
 
-
+      
 
 sub CreateMasterAccount {
 	my ($self, $pnParentContainerID, $pnTemplateID, $pnDataSegmentID, $paValues) = @_;
@@ -579,6 +905,7 @@ sub search_meter_by_proxyattr{
 	my ($self, $criteria) = @_;
 	return undef if (ref $criteria ne ref [] ) or !defined ($criteria->[0]);
     my $return_fields = ['ADAS_ID'];
+
 	my $rs = $self->search_AE($return_fields, $criteria);
 	my @IDs;
       while ( !$rs->EOF ) {
@@ -586,8 +913,21 @@ sub search_meter_by_proxyattr{
             $rs->MoveNext();
         }
 
+
     return  \@IDs;
 }
+
+sub search_meter_by_AMD{
+    my $self = shift;
+    my $result_ref_ref = $self->eval_AMD(@_);
+    my @AE_IDs = @{$$result_ref_ref[0]};
+	my @IDs;
+	for my $AE_ID (@AE_IDs){
+		 push @IDs, @{$self->search_meter_by_proxyattr([['AEID', $AE_ID]])};
+	 }
+	 return \@IDs;
+}
+
 
 =head1 AUTHOR
 
@@ -603,18 +943,7 @@ automatically be notified of progress on your bug as I make changes.
 
 
 =head1 TODO 
-extends qw(
-	C3000::MeterDataIntergface
-	C3000::ADASInstanceManager
-	C3000::ContainerManager
-	C3000::ContainerTemplateManager
-	C3000::ActiveElementManager
-	C3000::ActiveElementTemplateManager
-	C3000::SecurityUserSession
-	C3000::DataSegment
 
-);
-consider use Moose
 
 =over 4
 

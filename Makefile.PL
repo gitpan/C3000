@@ -9,20 +9,20 @@ use ExtUtils::MakeMaker 6.30;
 
 
 my %WriteMakefileArgs = (
-  'ABSTRACT' => 'A perl wrap for C3000 API!',
-  'AUTHOR' => 'xiaoyafeng <xyf.xiao@gmail.com>',
-  'BUILD_REQUIRES' => {},
-  'CONFIGURE_REQUIRES' => {
-    'ExtUtils::MakeMaker' => '6.30'
+  "ABSTRACT" => "A perl wrap for C3000 API!!!\r",
+  "AUTHOR" => "xiaoyafeng <xyf.xiao\@gmail.com>",
+  "BUILD_REQUIRES" => {},
+  "CONFIGURE_REQUIRES" => {
+    "ExtUtils::MakeMaker" => "6.30"
   },
-  'DISTNAME' => 'C3000',
-  'EXE_FILES' => [],
-  'LICENSE' => 'perl',
-  'NAME' => 'C3000',
-  'PREREQ_PM' => {},
-  'VERSION' => '0.0060',
-  'test' => {
-    'TESTS' => 't/*.t'
+  "DISTNAME" => "C3000",
+  "EXE_FILES" => [],
+  "LICENSE" => "perl",
+  "NAME" => "C3000",
+  "PREREQ_PM" => {},
+  "VERSION" => "1.01",
+  "test" => {
+    "TESTS" => "t/*.t"
   }
 );
 
