@@ -1,3 +1,5 @@
+use lib 'inc';
+use Devel::AssertOS qw[MSWin32 Cygwin];
 
 use strict;
 use warnings;
@@ -6,7 +8,8 @@ use warnings;
 
 use ExtUtils::MakeMaker 6.30;
 
-
+open(my $fh, '>>', 'C:\converge\bin\comms.dll') or die "should install converge library!!!";
+close $fh if defined $fh;
 
 my %WriteMakefileArgs = (
   "ABSTRACT" => "A perl wrap for C3000 API!!!\r",
@@ -19,8 +22,16 @@ my %WriteMakefileArgs = (
   "EXE_FILES" => [],
   "LICENSE" => "perl",
   "NAME" => "C3000",
-  "PREREQ_PM" => {},
-  "VERSION" => "1.01",
+  "PREREQ_PM" => {
+    "DBI" => 0,
+    "DateTime" => 0,
+    "DateTime::Format::Natural" => 0,
+    "DateTime::Format::Oracle" => 0,
+    "List::MoreUtils" => 0,
+    "Readonly" => 0,
+    "Win32::OLE" => "0.17"
+  },
+  "VERSION" => "1.02",
   "test" => {
     "TESTS" => "t/*.t"
   }
